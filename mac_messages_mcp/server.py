@@ -4,8 +4,12 @@ Mac Messages MCP - Entry point fixed for proper MCP protocol implementation
 """
 
 import asyncio
+import base64
 import logging
+import os
+import sqlite3
 import sys
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -247,6 +251,102 @@ def tool_fuzzy_search_messages(
     except Exception as e:
         logger.error(f"Error in tool_fuzzy_search_messages: {e}", exc_info=True)
         return f"An unexpected error occurred during fuzzy message search: {str(e)}"
+
+
+@mcp.tool()
+def tool_get_attachments(ctx: Context, contact: str, hours: int = 168) -> str:
+    """
+    Get attachments (images, documents, files) from messages with a contact.
+    For images and text files, returns the actual content so Claude can read/view them.
+    For other files, returns metadata and local file path.
+
+    Args:
+        contact: Contact name, phone number, or email to filter by
+        hours: Number of hours to look back (default: 168 = 1 week)
+    """
+    logger.info(f"Getting attachments: contact={contact}, hours={hours}")
+    try:
+        from mac_messages_mcp.messages import get_messages_db_path, find_contact_by_name
+
+        # Resolve contact to phone number
+        phone_filter = contact
+        if not contact.lstrip("+").isdigit():
+            matches = find_contact_by_name(contact)
+            if matches:
+                phone_filter = matches[0]["phone"].replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+        db_path = get_messages_db_path()
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Apple epoch starts 2001-01-01; convert hours to nanoseconds offset
+        cutoff_ns = int((datetime.now(timezone.utc).timestamp() - 978307200 - hours * 3600) * 1e9)
+
+        cursor.execute("""
+            SELECT
+                a.filename,
+                a.mime_type,
+                a.transfer_name,
+                m.date,
+                m.is_from_me
+            FROM attachment a
+            JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+            JOIN message m ON maj.message_id = m.ROWID
+            JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+            JOIN chat c ON cmj.chat_id = c.ROWID
+            WHERE c.chat_identifier LIKE ?
+              AND m.date > ?
+              AND a.filename IS NOT NULL
+            ORDER BY m.date DESC
+        """, (f"%{phone_filter}%", cutoff_ns))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return f"No attachments found for {contact} in the last {hours} hours."
+
+        results = []
+        for row in rows:
+            raw_path = row["filename"]
+            # Expand ~ in path
+            path = os.path.expanduser(raw_path) if raw_path.startswith("~") else raw_path
+            mime = row["mime_type"] or ""
+            name = row["transfer_name"] or os.path.basename(path)
+            sender = "You" if row["is_from_me"] else contact
+            # Convert Apple nanosecond timestamp to human readable
+            ts = datetime.fromtimestamp(row["date"] / 1e9 + 978307200, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+            entry = {
+                "file": name,
+                "sender": sender,
+                "time": ts,
+                "mime": mime,
+                "path": path,
+            }
+
+            if os.path.exists(path):
+                if mime.startswith("image/"):
+                    with open(path, "rb") as f:
+                        entry["content_base64"] = base64.b64encode(f.read()).decode("utf-8")
+                    entry["note"] = "Image content encoded as base64 above"
+                elif mime.startswith("text/") or path.endswith((".md", ".txt", ".csv", ".json", ".log")):
+                    with open(path, "r", errors="replace") as f:
+                        entry["content_text"] = f.read()
+                else:
+                    entry["note"] = "Binary file — use path to open locally"
+            else:
+                entry["note"] = "File not found on disk (may have been deleted)"
+
+            results.append(entry)
+
+        import json
+        return json.dumps(results, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error in get_attachments: {str(e)}", exc_info=True)
+        return f"Error getting attachments: {str(e)}"
 
 
 @mcp.resource("messages://recent/{hours}")
